@@ -28,15 +28,16 @@ export function QuestionCard({
   mode?: "DAILY" | "PRACTICE";
   onAnswered?: (correct: boolean) => void;
 }) {
-  const [selected, setSelected] = useState<string>("");
+  const [selections, setSelections] = useState<Record<string, "A" | "B" | "C" | "D">>({});
   const [bookmarked, setBookmarked] = useState(false);
   const paperOne = (question.paper ?? (question.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_1";
+  const selected = selections[question.id] ?? "";
 
   useEffect(() => setBookmarked(getBookmarks().includes(question.id)), [question.id]);
 
   function select(option: "A" | "B" | "C" | "D") {
     if (selected) return;
-    setSelected(option);
+    setSelections((current) => ({ ...current, [question.id]: option }));
     const correct = option === question.correct_option;
     recordAttempt({
       questionId: question.id,
