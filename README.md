@@ -1,36 +1,94 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# NetPrep - NET Daily 10
 
-## Getting Started
+A no-login UGC NET practice application built with Next.js, Supabase, and Gemini.
 
-First, run the development server:
+## Local development
 
-```bash
+```powershell
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Before deployment:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```powershell
+npm run build
+```
 
-## Learn More
+## Environment variables
 
-To learn more about Next.js, take a look at the following resources:
+Copy `.env.example` to `.env.local`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```text
+NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<supabase-anon-key>
+SUPABASE_SERVICE_ROLE_KEY=<supabase-service-role-secret>
+GEMINI_API_KEY=<gemini-api-key>
+DATABASE_URL=postgresql://postgres:<password>@db.<project-ref>.supabase.co:5432/postgres
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Never commit real secrets. The anon key is browser-safe; service-role, Gemini, and database credentials are server-only.
 
-## Deploy on Vercel
+## Supabase setup
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. Create or open a Supabase project.
+2. Apply `supabase/migrations/202611240001_netprep_public.sql`.
+3. Confirm public read policies exist for `questions`, `daily_quizzes`, and `publication_history`.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Deploy to Vercel
+
+### GitHub deployment
+
+1. Create a GitHub repository and push this project.
+2. Import it at `https://vercel.com/new`.
+3. Keep the framework preset as **Next.js**.
+4. Add these project environment variables:
+   - `NEXT_PUBLIC_SUPABASE_URL`
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+   - `GEMINI_API_KEY`
+5. Deploy.
+6. Future changes: commit and push to `main`; Vercel deploys automatically.
+
+### Vercel CLI
+
+```powershell
+npm install -g vercel
+vercel login
+vercel
+vercel --prod
+```
+
+Add production secrets through the Vercel project settings or CLI:
+
+```powershell
+vercel env add NEXT_PUBLIC_SUPABASE_URL production
+vercel env add NEXT_PUBLIC_SUPABASE_ANON_KEY production
+vercel env add SUPABASE_SERVICE_ROLE_KEY production
+vercel env add GEMINI_API_KEY production
+```
+
+## Modify the app
+
+- Daily page: `app/page.tsx`
+- Archive: `app/archive/page.tsx`
+- PYQ/PDF bank: `app/pyqs/page.tsx`
+- Analytics: `app/analytics/page.tsx`
+- Bookmarks: `app/bookmarks/page.tsx`
+- Navigation: `components/NavBar.tsx`
+- Unit definitions: `lib/syllabus.ts`
+- Gemini prompts/models: `lib/gemini.ts`
+- Daily quiz engine: `app/api/today/route.ts`
+- Question filters: `app/api/questions/route.ts`
+- Database changes: add a file under `supabase/migrations/`
+
+Run `npm run build` before every push.
+
+## PYQ seeding
+
+```powershell
+python scripts/seed_pyqs.py --dir pyq_pdfs --extract-only
+python scripts/seed_pyqs.py --upload-only
+```
