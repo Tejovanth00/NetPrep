@@ -36,8 +36,14 @@ function write(progress: Progress) {
 
 export function recordAttempt(attempt: Attempt) {
   const progress = read();
-  progress.attempts[attempt.questionId] = attempt;
+  progress.attempts[`${attempt.mode}:${attempt.questionId}`] = attempt;
   write(progress);
+}
+
+export function getAttempt(questionId: string, mode: Attempt["mode"]) {
+  const progress = read();
+  return progress.attempts[`${mode}:${questionId}`]
+    ?? (progress.attempts[questionId]?.mode === mode ? progress.attempts[questionId] : undefined);
 }
 
 export function completeDailyQuiz(date: string, score: number, total: number) {

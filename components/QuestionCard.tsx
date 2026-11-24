@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { Bookmark, CheckCircle2, XCircle } from "lucide-react";
 import { MarkdownRenderer } from "@/components/MarkdownRenderer";
-import { getBookmarks, recordAttempt, toggleBookmark } from "@/lib/localProgress";
+import { getAttempt, getBookmarks, recordAttempt, toggleBookmark } from "@/lib/localProgress";
 
 export type QuestionCardData = {
   id: string;
@@ -33,7 +33,13 @@ export function QuestionCard({
   const paperOne = (question.paper ?? (question.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_1";
   const selected = selections[question.id] ?? "";
 
-  useEffect(() => setBookmarked(getBookmarks().includes(question.id)), [question.id]);
+  useEffect(() => {
+    setBookmarked(getBookmarks().includes(question.id));
+    const savedAttempt = getAttempt(question.id, mode);
+    if (savedAttempt) {
+      setSelections((current) => ({ ...current, [question.id]: savedAttempt.selectedOption }));
+    }
+  }, [question.id, mode]);
 
   function select(option: "A" | "B" | "C" | "D") {
     if (selected) return;

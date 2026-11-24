@@ -18,7 +18,17 @@ export default function Home() {
       .then(async (response) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.error ?? "Could not load today's quiz");
-        setQuestions(data.questions ?? []);
+        const dailyQuestions: QuestionCardData[] = data.questions ?? [];
+        const dailyAttempts = getAttempts().filter((attempt) => attempt.mode === "DAILY");
+        const savedAnswers = Object.fromEntries(
+          dailyAttempts
+            .filter((attempt) => dailyQuestions.some((question) => question.id === attempt.questionId))
+            .map((attempt) => [attempt.questionId, attempt.isCorrect]),
+        );
+        setQuestions(dailyQuestions);
+        setAnswered(savedAnswers);
+        const firstUnanswered = dailyQuestions.findIndex((question) => !(question.id in savedAnswers));
+        setCurrent(firstUnanswered < 0 ? 0 : firstUnanswered);
         setDate(data.date ?? "");
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Could not load today's quiz"));
