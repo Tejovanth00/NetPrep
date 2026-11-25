@@ -137,6 +137,7 @@ export async function GET(request: NextRequest) {
       const unitNumber = slot.units[(index + 2) % slot.units.length];
       const unit = getSyllabusUnit(unitNumber);
       let mcq: NetMcq | null = null;
+      let lastGenerationError = "";
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const candidate = await generateNetMcq(
@@ -152,11 +153,14 @@ export async function GET(request: NextRequest) {
           avoidTexts.add(key);
           break;
         } catch (error) {
+          lastGenerationError = error instanceof Error ? error.message : String(error);
           console.warn(`Gemini attempt ${attempt + 1}/3 failed for unit ${unit.unitNumber}:`, error);
         }
       }
       if (!mcq) {
-        throw new Error(`Gemini could not generate a unique, valid question for Unit ${unit.unitNumber}.`);
+        throw new Error(
+          `Gemini could not generate a unique, valid question for Unit ${unit.unitNumber}. ${lastGenerationError}`,
+        );
       }
       const canonicalInsert = await supabaseAdmin.from("questions").insert({
         paper: unit.paper,
