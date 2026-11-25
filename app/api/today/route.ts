@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { generateNetMcq, type NetMcq } from "@/lib/gemini";
+import { generateDailyMcqs, type NetMcq, type NetQuestionPlan } from "@/lib/gemini";
 import { getSyllabusUnit } from "@/lib/syllabus";
+
+export const maxDuration = 60;
 
 function todayIST() {
   return new Intl.DateTimeFormat("en-CA", {
@@ -121,7 +123,7 @@ export async function GET(request: NextRequest) {
     const used = new Set((published ?? []).map((row: any) => row.question_id));
 
     const unused = (pyqs ?? []).filter((row: any) => !used.has(row.id));
-    const pool = unused.length ? unused : (pyqs ?? []);
+    const pool = unused;
     const paper1 = pool.filter((row: any) => (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_1");
     const paper2 = pool.filter((row: any) => (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_2");
     const selectedPyqs = [
@@ -135,65 +137,69 @@ export async function GET(request: NextRequest) {
       ).slice(0, Math.max(0, 4 - (paper1.slice(0, 1).length + paper2.slice(0, 3).length))),
     ].filter((row, index, rows) => rows.findIndex((item) => item.id === row.id) === index).slice(0, 4);
 
-    const aiRows: any[] = [];
-    const { data: allQuestions } = await supabaseAdmin
+    const { data: allQuestions, error: priorQuestionsError } = await supabaseAdmin
       .from("questions")
       .select("question_text")
       .limit(500);
+    if (priorQuestionsError) throw priorQuestionsError;
     const avoidTexts = new Set(
       (allQuestions ?? []).map((row: any) => normalizedText(row.question_text)),
     );
-    const slots: Array<{ paper: "PAPER_1" | "PAPER_2"; units: number[] }> = [
-      { paper: "PAPER_1", units: [107, 102, 101, 106, 108] },
-      { paper: "PAPER_1", units: [107, 102, 101, 106, 108] },
-      { paper: "PAPER_2", units: [7, 4, 5, 9, 8, 1, 10, 6, 2, 3] },
-      { paper: "PAPER_2", units: [7, 4, 5, 9, 8, 1, 10, 6, 2, 3] },
-      { paper: "PAPER_2", units: [7, 4, 5, 9, 8, 1, 10, 6, 2, 3] },
-      { paper: "PAPER_2", units: [7, 4, 5, 9, 8, 1, 10, 6, 2, 3] },
+    const paper1PyqCount = selectedPyqs.filter((row: any) =>
+      (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_1",
+    ).length;
+    const aiCount = 10 - selectedPyqs.length;
+    const paper1AiCount = Math.min(aiCount, Math.max(0, 3 - paper1PyqCount));
+    const paper2AiCount = aiCount - paper1AiCount;
+    const paper1Priority = [107, 102, 101, 106, 108, 105, 110, 103, 104, 109];
+    const paper2Priority = [7, 5, 4, 9, 8, 1, 10, 6, 2, 3];
+    const createPlans = (
+      paper: "PAPER_1" | "PAPER_2",
+      priority: number[],
+      count: number,
+    ): NetQuestionPlan[] => {
+      const alreadyRepresented = new Set(
+        selectedPyqs
+          .filter((row: any) => (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === paper)
+          .map((row: any) => row.unit_number),
+      );
+      const ordered = [
+        ...priority.filter((unitNumber) => !alreadyRepresented.has(unitNumber)),
+        ...priority.filter((unitNumber) => alreadyRepresented.has(unitNumber)),
+      ];
+      return ordered.slice(0, count).map((unitNumber) => {
+        const unit = getSyllabusUnit(unitNumber);
+        return { unitNumber, unitName: unit.unitName, paper };
+      });
+    };
+    const plans = [
+      ...createPlans("PAPER_1", paper1Priority, paper1AiCount),
+      ...createPlans("PAPER_2", paper2Priority, paper2AiCount),
     ];
+    const generated = await generateDailyMcqs(plans, Array.from(avoidTexts));
 
-    for (let index = 0; index < slots.length; index++) {
-      const slot = slots[index];
-      const unitNumber = slot.units[(index + 2) % slot.units.length];
-      const unit = getSyllabusUnit(unitNumber);
-      let mcq: NetMcq | null = null;
-      let lastGenerationError = "";
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const candidate = await generateNetMcq(
-            unit.unitNumber,
-            unit.unitName,
-            Array.from(avoidTexts).slice(0, 80),
-            unit.paper,
-          );
-          const key = normalizedText(candidate.question_text);
-          if (!key || avoidTexts.has(key)) continue;
-          if (Object.values(candidate.options).some((option) => !option?.trim())) continue;
-          mcq = randomizeOptions(candidate);
-          avoidTexts.add(key);
-          break;
-        } catch (error) {
-          lastGenerationError = error instanceof Error ? error.message : String(error);
-          console.warn(`Gemini attempt ${attempt + 1}/3 failed for unit ${unit.unitNumber}:`, error);
-        }
+    const aiRows: any[] = [];
+    for (let index = 0; index < plans.length; index++) {
+      const plan = plans[index];
+      const unit = getSyllabusUnit(plan.unitNumber);
+      const mcq = randomizeOptions(generated[index]);
+      const key = normalizedText(mcq.question_text);
+      if (!key || avoidTexts.has(key)) {
+        throw new Error(`Gemini returned a repeated question for Unit ${unit.unitNumber}.`);
       }
-      if (!mcq) {
-        throw new Error(
-          `Gemini could not generate a unique, valid question for Unit ${unit.unitNumber}. ${lastGenerationError}`,
-        );
-      }
+      avoidTexts.add(key);
       const canonicalInsert = await supabaseAdmin.from("questions").insert({
         paper: unit.paper,
         unit_number: unit.unitNumber,
         unit_name: unit.unitName,
-        question_text: mcq!.question_text,
-        options: mcq!.options,
-        option_a: mcq!.options.A,
-        option_b: mcq!.options.B,
-        option_c: mcq!.options.C,
-        option_d: mcq!.options.D,
-        correct_option: mcq!.correct_option,
-        explanation: mcq!.explanation,
+        question_text: mcq.question_text,
+        options: mcq.options,
+        option_a: mcq.options.A,
+        option_b: mcq.options.B,
+        option_c: mcq.options.C,
+        option_d: mcq.options.D,
+        correct_option: mcq.correct_option,
+        explanation: mcq.explanation,
         source_type: "AI",
         exam_year: null,
         exam_session: null,
@@ -203,10 +209,10 @@ export async function GET(request: NextRequest) {
         inserted = await supabaseAdmin.from("questions").insert({
           unit_number: unit.unitNumber,
           source_type: "AI",
-          question_text: mcq!.question_text,
-          options: mcq!.options,
-          correct_option: mcq!.correct_option,
-          explanation: mcq!.explanation,
+          question_text: mcq.question_text,
+          options: mcq.options,
+          correct_option: mcq.correct_option,
+          explanation: mcq.explanation,
           exam_year: null,
           exam_session: null,
         }).select("*").single();

@@ -7,12 +7,19 @@ const GENERATION_MODELS = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
 ] as const;
+const ANSWER_KEYS = ["A", "B", "C", "D"] as const;
 
 export type NetMcq = {
   question_text: string;
   options: { A: string; B: string; C: string; D: string };
-  correct_option: "A" | "B" | "C" | "D";
+  correct_option: (typeof ANSWER_KEYS)[number];
   explanation: string;
+};
+
+export type NetQuestionPlan = {
+  unitNumber: number;
+  unitName: string;
+  paper: "PAPER_1" | "PAPER_2";
 };
 
 function isTemporaryProviderError(error: unknown) {
@@ -23,7 +30,33 @@ function isTemporaryProviderError(error: unknown) {
     || /\b(429|500|502|503|504)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|timeout/i.test(message);
 }
 
-async function generateWithFallback(prompt: string) {
+function retryDelayMs(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/retryDelay["']?\s*:\s*["']?(\d+(?:\.\d+)?)s/i);
+  return match ? Number(match[1]) * 1000 : 0;
+}
+
+const mcqSchema = {
+  type: Type.OBJECT,
+  properties: {
+    question_text: { type: Type.STRING },
+    options: {
+      type: Type.OBJECT,
+      properties: {
+        A: { type: Type.STRING },
+        B: { type: Type.STRING },
+        C: { type: Type.STRING },
+        D: { type: Type.STRING },
+      },
+      required: ["A", "B", "C", "D"],
+    },
+    correct_option: { type: Type.STRING, enum: [...ANSWER_KEYS] },
+    explanation: { type: Type.STRING },
+  },
+  required: ["question_text", "options", "correct_option", "explanation"],
+};
+
+async function generateWithFallback(prompt: string, responseSchema: object) {
   if (!ai) throw new Error("GEMINI_API_KEY is not configured on the server.");
 
   let lastError: unknown;
@@ -34,37 +67,61 @@ async function generateWithFallback(prompt: string) {
         contents: prompt,
         config: {
           responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              question_text: { type: Type.STRING },
-              options: {
-                type: Type.OBJECT,
-                properties: {
-                  A: { type: Type.STRING },
-                  B: { type: Type.STRING },
-                  C: { type: Type.STRING },
-                  D: { type: Type.STRING },
-                },
-                required: ["A", "B", "C", "D"],
-              },
-              correct_option: { type: Type.STRING, enum: ["A", "B", "C", "D"] },
-              explanation: { type: Type.STRING },
-            },
-            required: ["question_text", "options", "correct_option", "explanation"],
-          },
+          responseSchema,
+          maxOutputTokens: 8192,
         },
       });
       return { response, model };
     } catch (error) {
       lastError = error;
       if (!isTemporaryProviderError(error)) throw error;
-      console.warn(`Gemini ${model} temporarily unavailable; trying fallback model.`);
+
+      const waitMs = retryDelayMs(error);
+      if (waitMs > 0 && waitMs <= 10000) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs + 250));
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema,
+              maxOutputTokens: 8192,
+            },
+          });
+          return { response, model };
+        } catch (retryError) {
+          lastError = retryError;
+        }
+      }
+
+      console.warn(`Gemini ${model} temporarily unavailable; trying the next model.`);
     }
   }
 
   const detail = lastError instanceof Error ? lastError.message : String(lastError);
   throw new Error(`All configured Gemini generation models are temporarily unavailable. ${detail}`);
+}
+
+function parseMcq(value: unknown, model: string): NetMcq {
+  if (!value || typeof value !== "object") {
+    throw new Error(`Gemini ${model} returned an invalid MCQ object.`);
+  }
+  const candidate = value as Partial<NetMcq>;
+  if (
+    typeof candidate.question_text !== "string" ||
+    typeof candidate.explanation !== "string" ||
+    !candidate.options ||
+    typeof candidate.options !== "object" ||
+    !ANSWER_KEYS.includes(candidate.correct_option as (typeof ANSWER_KEYS)[number]) ||
+    ANSWER_KEYS.some((key) => typeof candidate.options?.[key] !== "string" || !candidate.options[key].trim())
+  ) {
+    throw new Error(`Gemini ${model} returned invalid question fields.`);
+  }
+  if (!candidate.question_text.trim() || !candidate.explanation.trim()) {
+    throw new Error(`Gemini ${model} returned empty question text or explanation.`);
+  }
+  return candidate as NetMcq;
 }
 
 export async function generateNetMcq(
@@ -74,69 +131,78 @@ export async function generateNetMcq(
   paper: "PAPER_1" | "PAPER_2" = unitNumber >= 101 ? "PAPER_1" : "PAPER_2",
 ): Promise<NetMcq> {
   const paperPrompt = paper === "PAPER_1"
-    ? `Create one authentic NTA UGC NET Paper 1 (General Teaching & Research Aptitude) question.
-Use realistic formats such as Assertion-Reason, Statement I & II, teaching/research scenarios, number/letter series,
-syllogisms or Indian Logic Pramanas, ICT, communication, reading comprehension, data interpretation, or Higher Education.
-Target Unit ${unitNumber}: ${unitName}.`
-    : `Create one authentic NTA UGC NET Computer Science (Subject Code 87), Paper II question.
-Use recent 2024-2026 NTA trends: numericals, recurrence or complexity, SQL/normalization, OS scheduling/paging,
-TOC/automata, compiler concepts, or networking protocols as appropriate.
-Target Unit ${unitNumber}: ${unitName}.`;
+    ? `Create one authentic NTA UGC NET Paper 1 question for Unit ${unitNumber}: ${unitName}. Use syllabus-relevant aptitude concepts and realistic NTA formats.`
+    : `Create one authentic NTA UGC NET Computer Science (Subject Code 87), Paper II question for Unit ${unitNumber}: ${unitName}. Use postgraduate syllabus concepts and realistic NTA difficulty.`;
   const prompt = `${paperPrompt}
-Match authentic NTA wording, distractors, difficulty, and single-best-answer conventions.
-Avoid these topics or recent formulations: ${avoidTopics.join(", ") || "none"}.
-The question must be precise, self-contained, and have exactly one correct answer.
-Do not include Q/Paper/year references. Provide a concise conceptual explanation.`;
+Use exactly four plausible options and one correct answer. Independently solve the question and verify the answer key before responding. Give a concise step-by-step explanation.
+Avoid repeating or paraphrasing these prior questions/topics: ${avoidTopics.slice(0, 25).join(" | ") || "none"}.
+Return only the structured JSON object.`;
+  const { response, model } = await generateWithFallback(prompt, mcqSchema);
+  return parseMcq(JSON.parse(response.text ?? "{}"), model);
+}
 
-  const { response, model } = await generateWithFallback(prompt);
-  const parsed: unknown = JSON.parse(response.text ?? "{}");
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    !("question_text" in parsed) ||
-    !("options" in parsed) ||
-    !("correct_option" in parsed) ||
-    !("explanation" in parsed)
-  ) {
-    throw new Error(`Gemini ${model} returned an incomplete MCQ response.`);
-  }
-  const mcq = parsed as NetMcq;
-  if (
-    !mcq.question_text.trim() ||
-    !mcq.explanation.trim() ||
-    !["A", "B", "C", "D"].includes(mcq.correct_option) ||
-    (["A", "B", "C", "D"] as const).some((key) => !mcq.options[key]?.trim())
-  ) {
-    throw new Error(`Gemini ${model} returned invalid question fields.`);
+export async function generateDailyMcqs(
+  plans: NetQuestionPlan[],
+  avoidQuestions: string[],
+): Promise<NetMcq[]> {
+  if (plans.length !== 10) {
+    throw new Error(`Daily generation requires exactly 10 unit plans, received ${plans.length}.`);
   }
 
-  if (!ai) return mcq;
-  try {
-    const verification = await ai.models.generateContent({
-    model,
-    contents: `Verify the answer key for this MCQ. Return only JSON:
-{"matches_correct_option":true|false,"correct_option":"A"| "B"| "C"| "D","reason":"brief"}
-Question: ${mcq.question_text}
-Options: ${JSON.stringify(mcq.options)}
-Candidate correct_option: ${mcq.correct_option}`,
-      config: { responseMimeType: "application/json" },
-    });
-    const checked = JSON.parse(verification.text ?? "{}") as {
-      matches_correct_option?: boolean;
-      correct_option?: "A" | "B" | "C" | "D";
-    };
-    if (
-      checked.matches_correct_option === false &&
-      checked.correct_option &&
-      ["A", "B", "C", "D"].includes(checked.correct_option)
-    ) {
-      mcq.correct_option = checked.correct_option;
+  const list = plans.map((plan, index) =>
+    `${index + 1}. ${plan.paper}, unit ${plan.unitNumber}: ${plan.unitName}`,
+  ).join("\n");
+  const prompt = `Generate exactly 10 distinct, exam-grade UGC NET MCQs in one response, one for each plan in this order:
+${list}
+Paper 1 questions must be General Teaching and Research Aptitude. Paper 2 questions must be Computer Science Subject Code 87. Match postgraduate NTA difficulty, use plausible distractors, and cover current syllabus concepts. Do not copy or closely paraphrase the prior questions below:
+${avoidQuestions.slice(0, 25).map((text) => `- ${text.slice(0, 180)}`).join("\n") || "- none"}
+For every question, independently solve it and check that correct_option matches the options. Explanations should show the key reasoning steps. Return exactly one question per plan, preserving the listed order.`;
+
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      questions: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            unit_number: { type: Type.INTEGER },
+            question_text: { type: Type.STRING },
+            options: mcqSchema.properties.options,
+            correct_option: mcqSchema.properties.correct_option,
+            explanation: { type: Type.STRING },
+          },
+          required: ["unit_number", "question_text", "options", "correct_option", "explanation"],
+        },
+      },
+    },
+    required: ["questions"],
+  };
+
+  const { response, model } = await generateWithFallback(prompt, responseSchema);
+  const parsed = JSON.parse(response.text ?? "{}") as { questions?: unknown };
+  const generatedQuestions = parsed.questions;
+  if (!Array.isArray(generatedQuestions) || generatedQuestions.length !== plans.length) {
+    const count = Array.isArray(generatedQuestions) ? generatedQuestions.length : 0;
+    throw new Error(`Gemini ${model} returned ${count} questions; expected 10.`);
+  }
+
+  const seen = new Set<string>();
+  return generatedQuestions.map((item, index) => {
+    if (!item || typeof item !== "object" || !("unit_number" in item)) {
+      throw new Error(`Gemini ${model} returned an invalid question at position ${index + 1}.`);
     }
-  } catch (error) {
-    console.warn(`Gemini answer verification failed on ${model}; keeping generated answer key.`, error);
-  }
-
-  return mcq;
+    if (item.unit_number !== plans[index].unitNumber) {
+      throw new Error(`Gemini ${model} returned the wrong unit for question ${index + 1}.`);
+    }
+    const mcq = parseMcq(item, model);
+    const normalized = mcq.question_text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (seen.has(normalized)) {
+      throw new Error(`Gemini ${model} returned duplicate questions in the daily set.`);
+    }
+    seen.add(normalized);
+    return mcq;
+  });
 }
 
 export async function getEmbedding(text: string): Promise<number[]> {
