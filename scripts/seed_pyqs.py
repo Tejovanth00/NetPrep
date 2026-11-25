@@ -217,13 +217,19 @@ def upload_only(database_url: str) -> None:
                 with connection.cursor() as cursor:
                     cursor.executemany(
                         """insert into questions
-                        (paper, unit_number, unit_name, question_text, option_a, option_b, option_c, option_d,
+                        (paper, unit_number, unit_name, question_text, options, option_a, option_b, option_c, option_d,
                          correct_option, explanation, source_type, exam_year, exam_session, question_id)
-                        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PYQ',%s,%s,%s)
+                        values (%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,'PYQ',%s,%s,%s)
                         on conflict (question_id) do nothing""",
                         [
                             (
                                 item["paper"], item["unit_number"], item["unit_name"], item["question_text"],
+                                json.dumps({
+                                    "A": item["option_a"],
+                                    "B": item["option_b"],
+                                    "C": item["option_c"],
+                                    "D": item["option_d"],
+                                }),
                                 item["option_a"], item["option_b"], item["option_c"], item["option_d"],
                                 item["correct_option"], item["explanation"], item.get("exam_year"),
                                 item.get("exam_session"), item.get("question_id"),

@@ -37,6 +37,26 @@ function normalizedText(text: string) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function randomizeOptions(mcq: NetMcq): NetMcq {
+  const entries = (["A", "B", "C", "D"] as const).map((key) => ({
+    originalKey: key,
+    text: mcq.options[key],
+  }));
+  for (let index = entries.length - 1; index > 0; index--) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [entries[index], entries[randomIndex]] = [entries[randomIndex], entries[index]];
+  }
+
+  const options = { A: "", B: "", C: "", D: "" };
+  let correctOption: NetMcq["correct_option"] = "A";
+  entries.forEach((entry, index) => {
+    const newKey = (["A", "B", "C", "D"] as const)[index];
+    options[newKey] = entry.text;
+    if (entry.originalKey === mcq.correct_option) correctOption = newKey;
+  });
+  return { ...mcq, options, correct_option: correctOption };
+}
+
 async function fetchByIds(ids: string[]) {
   if (!ids.length) return [];
   const { data, error } = await supabaseAdmin
@@ -149,7 +169,7 @@ export async function GET(request: NextRequest) {
           const key = normalizedText(candidate.question_text);
           if (!key || avoidTexts.has(key)) continue;
           if (Object.values(candidate.options).some((option) => !option?.trim())) continue;
-          mcq = candidate;
+          mcq = randomizeOptions(candidate);
           avoidTexts.add(key);
           break;
         } catch (error) {
@@ -167,6 +187,7 @@ export async function GET(request: NextRequest) {
         unit_number: unit.unitNumber,
         unit_name: unit.unitName,
         question_text: mcq!.question_text,
+        options: mcq!.options,
         option_a: mcq!.options.A,
         option_b: mcq!.options.B,
         option_c: mcq!.options.C,
