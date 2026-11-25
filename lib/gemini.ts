@@ -145,14 +145,17 @@ export async function generateDailyMcqs(
   plans: NetQuestionPlan[],
   avoidQuestions: string[],
 ): Promise<NetMcq[]> {
-  if (plans.length !== 10) {
-    throw new Error(`Daily generation requires exactly 10 unit plans, received ${plans.length}.`);
+  if (plans.length > 10) {
+    throw new Error(`Daily generation accepts at most 10 unit plans, received ${plans.length}.`);
+  }
+  if (plans.length === 0) {
+    return [];
   }
 
   const list = plans.map((plan, index) =>
     `${index + 1}. ${plan.paper}, unit ${plan.unitNumber}: ${plan.unitName}`,
   ).join("\n");
-  const prompt = `Generate exactly 10 distinct, exam-grade UGC NET MCQs in one response, one for each plan in this order:
+  const prompt = `Generate exactly ${plans.length} distinct, exam-grade UGC NET MCQs in one response, one for each plan in this order:
 ${list}
 Paper 1 questions must be General Teaching and Research Aptitude. Paper 2 questions must be Computer Science Subject Code 87. Match postgraduate NTA difficulty, use plausible distractors, and cover current syllabus concepts. Do not copy or closely paraphrase the prior questions below:
 ${avoidQuestions.slice(0, 25).map((text) => `- ${text.slice(0, 180)}`).join("\n") || "- none"}
@@ -184,7 +187,7 @@ For every question, independently solve it and check that correct_option matches
   const generatedQuestions = parsed.questions;
   if (!Array.isArray(generatedQuestions) || generatedQuestions.length !== plans.length) {
     const count = Array.isArray(generatedQuestions) ? generatedQuestions.length : 0;
-    throw new Error(`Gemini ${model} returned ${count} questions; expected 10.`);
+    throw new Error(`Gemini ${model} returned ${count} questions; expected ${plans.length}.`);
   }
 
   const seen = new Set<string>();

@@ -139,7 +139,7 @@ export async function GET(request: NextRequest) {
 
     const { data: allQuestions, error: priorQuestionsError } = await supabaseAdmin
       .from("questions")
-      .select("question_text")
+      .select("*")
       .limit(500);
     if (priorQuestionsError) throw priorQuestionsError;
     const avoidTexts = new Set(
@@ -153,13 +153,65 @@ export async function GET(request: NextRequest) {
     const paper2AiCount = aiCount - paper1AiCount;
     const paper1Priority = [107, 102, 101, 106, 108, 105, 110, 103, 104, 109];
     const paper2Priority = [7, 5, 4, 9, 8, 1, 10, 6, 2, 3];
+    const isGenericFallback = (text: string) => {
+      const normalized = normalizedText(text);
+      return normalized.includes("formal modeling and systematic analysis")
+        || normalized.includes("principle for evaluating an academic or teaching scenario");
+    };
+    const unusedAi = (allQuestions ?? []).filter((row: any) => {
+      if (row.source_type !== "AI" || used.has(row.id) || isGenericFallback(row.question_text ?? "")) return false;
+      if (!["A", "B", "C", "D"].includes(row.correct_option)) return false;
+      const question = normalizeQuestion(row);
+      return Object.values(question.options).every((option) => option.trim().length > 0);
+    });
+    const selectExistingAi = (
+      paper: "PAPER_1" | "PAPER_2",
+      priority: number[],
+      count: number,
+    ) => {
+      if (count <= 0) return [];
+      const candidates = unusedAi
+        .filter((row: any) =>
+          (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === paper,
+        )
+        .sort((left: any, right: any) => {
+          const unitOrder = priority.indexOf(left.unit_number) - priority.indexOf(right.unit_number);
+          if (unitOrder !== 0) return unitOrder;
+          return String(left.created_at ?? "").localeCompare(String(right.created_at ?? ""));
+        });
+      const selected: any[] = [];
+      const representedUnits = new Set<number>();
+      const seenText = new Set<string>();
+      for (const row of candidates) {
+        const key = normalizedText(row.question_text);
+        if (!key || seenText.has(key) || representedUnits.has(row.unit_number)) continue;
+        selected.push(row);
+        seenText.add(key);
+        representedUnits.add(row.unit_number);
+        if (selected.length === count) break;
+      }
+      if (selected.length < count) {
+        for (const row of candidates) {
+          const key = normalizedText(row.question_text);
+          if (!key || seenText.has(key)) continue;
+          selected.push(row);
+          seenText.add(key);
+          if (selected.length === count) break;
+        }
+      }
+      return selected;
+    };
+    const existingAiRows = [
+      ...selectExistingAi("PAPER_1", paper1Priority, paper1AiCount),
+      ...selectExistingAi("PAPER_2", paper2Priority, paper2AiCount),
+    ];
     const createPlans = (
       paper: "PAPER_1" | "PAPER_2",
       priority: number[],
       count: number,
     ): NetQuestionPlan[] => {
       const alreadyRepresented = new Set(
-        selectedPyqs
+        [...selectedPyqs, ...existingAiRows]
           .filter((row: any) => (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === paper)
           .map((row: any) => row.unit_number),
       );
@@ -172,13 +224,22 @@ export async function GET(request: NextRequest) {
         return { unitNumber, unitName: unit.unitName, paper };
       });
     };
+    const paper1ExistingAiCount = existingAiRows.filter((row: any) =>
+      (row.paper ?? (row.unit_number >= 101 ? "PAPER_1" : "PAPER_2")) === "PAPER_1",
+    ).length;
+    const paper2ExistingAiCount = existingAiRows.length - paper1ExistingAiCount;
     const plans = [
-      ...createPlans("PAPER_1", paper1Priority, paper1AiCount),
-      ...createPlans("PAPER_2", paper2Priority, paper2AiCount),
+      ...createPlans("PAPER_1", paper1Priority, paper1AiCount - paper1ExistingAiCount),
+      ...createPlans("PAPER_2", paper2Priority, paper2AiCount - paper2ExistingAiCount),
     ];
-    const generated = await generateDailyMcqs(plans, Array.from(avoidTexts));
+    const generated = plans.length
+      ? await generateDailyMcqs(
+        plans,
+        Array.from(avoidTexts),
+      )
+      : [];
 
-    const aiRows: any[] = [];
+    const aiRows: any[] = [...existingAiRows];
     for (let index = 0; index < plans.length; index++) {
       const plan = plans[index];
       const unit = getSyllabusUnit(plan.unitNumber);
@@ -229,33 +290,56 @@ export async function GET(request: NextRequest) {
 
     let { error: raceError } = await supabaseAdmin
       .from("daily_quizzes")
-      .insert({ quiz_date: date, question_ids: questionIds })
+      .insert({
+        quiz_date: date,
+        question_ids: questionIds,
+        exam_target_date: "2026-12-14",
+      })
       .select("quiz_date");
     if (raceError?.code === "42703") {
-      const legacyRace = await supabaseAdmin
+      const canonicalRace = await supabaseAdmin
         .from("daily_quizzes")
-        .insert({ quiz_date: date, exam_target_date: "2026-12-14" })
+        .insert({ quiz_date: date, question_ids: questionIds })
         .select("quiz_date");
-      raceError = legacyRace.error;
+      raceError = canonicalRace.error;
+      if (raceError?.code === "42703") {
+        const legacyRace = await supabaseAdmin
+          .from("daily_quizzes")
+          .insert({ quiz_date: date, exam_target_date: "2026-12-14" })
+          .select("quiz_date");
+        raceError = legacyRace.error;
+      }
     }
     if (raceError && raceError.code !== "23505") throw raceError;
 
     const canonicalIds = questionIds;
     const publicationResult = await supabaseAdmin
       .from("publication_history")
-      .upsert(canonicalIds.map((questionId) => ({
+      .upsert(canonicalIds.map((questionId, index) => ({
         question_id: questionId,
         published_date: date,
+        quiz_date: date,
+        question_order: index + 1,
       })), { onConflict: "question_id" });
     if (publicationResult.error?.code === "42703") {
-      const legacyPublication = await supabaseAdmin
+      const canonicalPublication = await supabaseAdmin
         .from("publication_history")
-        .upsert(canonicalIds.map((questionId, index) => ({
+        .upsert(canonicalIds.map((questionId) => ({
           question_id: questionId,
-          quiz_date: date,
-          question_order: index + 1,
+          published_date: date,
         })), { onConflict: "question_id" });
-      if (legacyPublication.error) throw legacyPublication.error;
+      if (canonicalPublication.error?.code === "42703") {
+        const legacyPublication = await supabaseAdmin
+          .from("publication_history")
+          .upsert(canonicalIds.map((questionId, index) => ({
+            question_id: questionId,
+            quiz_date: date,
+            question_order: index + 1,
+          })), { onConflict: "question_id" });
+        if (legacyPublication.error) throw legacyPublication.error;
+      } else if (canonicalPublication.error) {
+        throw canonicalPublication.error;
+      }
     } else if (publicationResult.error) {
       throw publicationResult.error;
     }
