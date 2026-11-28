@@ -12,13 +12,37 @@ export default function Home() {
   const [answered, setAnswered] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
   const [date, setDate] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
-    fetch("/api/today")
-      .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error ?? "Could not load today's quiz");
-        const dailyQuestions: QuestionCardData[] = data.questions ?? [];
+    let cancelled = false;
+
+    async function loadToday() {
+      setLoading(true);
+      setError("");
+      try {
+        const response = await fetch("/api/today", { cache: "no-store" });
+        const body = await response.text();
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          throw new Error(`Quiz service returned an invalid response (HTTP ${response.status}). Please try again shortly.`);
+        }
+        if (typeof parsed !== "object" || parsed === null) {
+          throw new Error(`Quiz service returned an invalid response (HTTP ${response.status}). Please try again shortly.`);
+        }
+        const data = parsed as { error?: string; questions?: QuestionCardData[]; date?: string };
+        if (!response.ok) {
+          throw new Error(data.error ?? `Could not load today's quiz (HTTP ${response.status}).`);
+        }
+        if (!Array.isArray(data.questions) || data.questions.length !== 10) {
+          throw new Error("Quiz service did not return a complete 10-question quiz. Please try again.");
+        }
+
+        if (cancelled) return;
+        const dailyQuestions = data.questions;
         const dailyAttempts = getAttempts().filter((attempt) => attempt.mode === "DAILY");
         const savedAnswers = Object.fromEntries(
           dailyAttempts
@@ -30,9 +54,20 @@ export default function Home() {
         const firstUnanswered = dailyQuestions.findIndex((question) => !(question.id in savedAnswers));
         setCurrent(firstUnanswered < 0 ? 0 : firstUnanswered);
         setDate(data.date ?? "");
-      })
-      .catch((cause) => setError(cause instanceof Error ? cause.message : "Could not load today's quiz"));
-  }, []);
+      } catch (cause) {
+        if (!cancelled) {
+          setError(cause instanceof Error ? cause.message : "Could not load today's quiz.");
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void loadToday();
+    return () => {
+      cancelled = true;
+    };
+  }, [retryCount]);
 
   const score = Object.values(answered).filter(Boolean).length;
   const complete = questions.length > 0 && Object.keys(answered).length === questions.length;
@@ -61,8 +96,20 @@ export default function Home() {
           {date && <p className="mt-1 font-medium text-slate-700">{date}</p>}
         </header>
         <ExamCountdown />
-        {error && <div className="mt-5 rounded-xl border border-rose-300 bg-rose-50 p-4 text-rose-900">{error}</div>}
-        {!error && questions.length === 0 && <div className="mt-5 rounded-xl border border-slate-300 bg-white p-8 text-center text-slate-700">Preparing today's questions...</div>}
+        {error && (
+          <div className="mt-5 rounded-xl border border-rose-300 bg-rose-50 p-4 text-rose-900">
+            <p>{error}</p>
+            <button
+              type="button"
+              onClick={() => setRetryCount((count) => count + 1)}
+              disabled={loading}
+              className="mt-3 rounded-lg bg-rose-800 px-4 py-2 font-bold text-white disabled:opacity-50"
+            >
+              {loading ? "Retrying..." : "Retry"}
+            </button>
+          </div>
+        )}
+        {loading && questions.length === 0 && <div className="mt-5 rounded-xl border border-slate-300 bg-white p-8 text-center text-slate-700">Preparing today&apos;s questions...</div>}
         {questions.length > 0 && !complete && (
           <>
             <div className="my-5 h-2 overflow-hidden rounded-full bg-slate-300">

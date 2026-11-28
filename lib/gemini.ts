@@ -30,6 +30,11 @@ function isTemporaryProviderError(error: unknown) {
     || /\b(429|500|502|503|504)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|timeout/i.test(message);
 }
 
+function providerStatus(error: unknown) {
+  const candidate = error as { status?: number; status_code?: number } | null;
+  return candidate?.status ?? candidate?.status_code;
+}
+
 function retryDelayMs(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   const match = message.match(/retryDelay["']?\s*:\s*["']?(\d+(?:\.\d+)?)s/i);
@@ -56,11 +61,19 @@ const mcqSchema = {
   required: ["question_text", "options", "correct_option", "explanation"],
 };
 
-async function generateWithFallback(prompt: string, responseSchema: object) {
+type ProviderRetryBudget = { remaining: number };
+
+async function generateWithFallback(
+  prompt: string,
+  responseSchema: object,
+  retryBudget: ProviderRetryBudget = { remaining: 1 },
+) {
   if (!ai) throw new Error("GEMINI_API_KEY is not configured on the server.");
 
   let lastError: unknown;
+  let lastModel: (typeof GENERATION_MODELS)[number] = GENERATION_MODELS[0];
   for (const model of GENERATION_MODELS) {
+    lastModel = model;
     try {
       const response = await ai.models.generateContent({
         model,
@@ -77,7 +90,7 @@ async function generateWithFallback(prompt: string, responseSchema: object) {
       if (!isTemporaryProviderError(error)) throw error;
 
       const waitMs = retryDelayMs(error);
-      if (waitMs > 0 && waitMs <= 10000) {
+      if (waitMs > 0 && waitMs <= 10000 && providerStatus(error) !== 503) {
         await new Promise((resolve) => setTimeout(resolve, waitMs + 250));
         try {
           const response = await ai.models.generateContent({
@@ -96,6 +109,25 @@ async function generateWithFallback(prompt: string, responseSchema: object) {
       }
 
       console.warn(`Gemini ${model} temporarily unavailable; trying the next model.`);
+    }
+  }
+
+  if (providerStatus(lastError) === 503 && retryBudget.remaining > 0) {
+    retryBudget.remaining--;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    try {
+      const response = await ai.models.generateContent({
+        model: lastModel,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema,
+          maxOutputTokens: 8192,
+        },
+      });
+      return { response, model: lastModel };
+    } catch (error) {
+      lastError = error;
     }
   }
 
@@ -155,10 +187,11 @@ export async function generateDailyMcqs(
   const generated: NetMcq[] = [];
   const seen = new Set<string>();
   const batchSize = 3;
+  const retryBudget: ProviderRetryBudget = { remaining: 1 };
 
   for (let start = 0; start < plans.length; start += batchSize) {
     const batchPlans = plans.slice(start, start + batchSize);
-    const batch = await generateDailyMcqBatch(batchPlans, avoidQuestions);
+    const batch = await generateDailyMcqBatch(batchPlans, avoidQuestions, retryBudget);
     for (const mcq of batch) {
       const normalized = mcq.question_text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
       if (seen.has(normalized)) {
@@ -175,6 +208,7 @@ export async function generateDailyMcqs(
 async function generateDailyMcqBatch(
   plans: NetQuestionPlan[],
   avoidQuestions: string[],
+  retryBudget: ProviderRetryBudget,
 ): Promise<NetMcq[]> {
   const list = plans.map((plan, index) =>
     `${index + 1}. ${plan.paper}, unit ${plan.unitNumber}: ${plan.unitName}`,
@@ -206,12 +240,12 @@ For every question, independently solve it and check that correct_option matches
     required: ["questions"],
   };
 
-  const { response, model } = await generateWithFallback(prompt, responseSchema);
+  const { response, model } = await generateWithFallback(prompt, responseSchema, retryBudget);
   let parsed: { questions?: unknown };
   try {
     parsed = JSON.parse(response.text ?? "") as { questions?: unknown };
   } catch {
-    return splitInvalidBatch(plans, avoidQuestions, model, "invalid or truncated JSON");
+    return splitInvalidBatch(plans, avoidQuestions, model, "invalid or truncated JSON", retryBudget);
   }
   const generatedQuestions = parsed.questions;
   if (!Array.isArray(generatedQuestions) || generatedQuestions.length !== plans.length) {
@@ -221,6 +255,7 @@ For every question, independently solve it and check that correct_option matches
       avoidQuestions,
       model,
       `returned ${count} questions; expected ${plans.length}`,
+      retryBudget,
     );
   }
 
@@ -245,7 +280,7 @@ For every question, independently solve it and check that correct_option matches
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    return splitInvalidBatch(plans, avoidQuestions, model, detail);
+    return splitInvalidBatch(plans, avoidQuestions, model, detail, retryBudget);
   }
   return result;
 }
@@ -255,14 +290,15 @@ async function splitInvalidBatch(
   avoidQuestions: string[],
   model: string,
   reason: string,
+  retryBudget: ProviderRetryBudget,
 ): Promise<NetMcq[]> {
   if (plans.length === 1) {
     throw new Error(`Gemini ${model} returned an invalid question (${reason}).`);
   }
   console.warn(`Gemini ${model} returned ${reason}; retrying in smaller batches.`);
   const midpoint = Math.ceil(plans.length / 2);
-  const first = await generateDailyMcqBatch(plans.slice(0, midpoint), avoidQuestions);
-  const second = await generateDailyMcqBatch(plans.slice(midpoint), avoidQuestions);
+  const first = await generateDailyMcqBatch(plans.slice(0, midpoint), avoidQuestions, retryBudget);
+  const second = await generateDailyMcqBatch(plans.slice(midpoint), avoidQuestions, retryBudget);
   return [...first, ...second];
 }
 
