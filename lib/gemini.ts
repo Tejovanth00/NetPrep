@@ -152,6 +152,30 @@ export async function generateDailyMcqs(
     return [];
   }
 
+  const generated: NetMcq[] = [];
+  const seen = new Set<string>();
+  const batchSize = 3;
+
+  for (let start = 0; start < plans.length; start += batchSize) {
+    const batchPlans = plans.slice(start, start + batchSize);
+    const batch = await generateDailyMcqBatch(batchPlans, avoidQuestions);
+    for (const mcq of batch) {
+      const normalized = mcq.question_text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      if (seen.has(normalized)) {
+        throw new Error(`Gemini returned duplicate questions in the daily set.`);
+      }
+      seen.add(normalized);
+      generated.push(mcq);
+    }
+  }
+
+  return generated;
+}
+
+async function generateDailyMcqBatch(
+  plans: NetQuestionPlan[],
+  avoidQuestions: string[],
+): Promise<NetMcq[]> {
   const list = plans.map((plan, index) =>
     `${index + 1}. ${plan.paper}, unit ${plan.unitNumber}: ${plan.unitName}`,
   ).join("\n");
@@ -183,29 +207,63 @@ For every question, independently solve it and check that correct_option matches
   };
 
   const { response, model } = await generateWithFallback(prompt, responseSchema);
-  const parsed = JSON.parse(response.text ?? "{}") as { questions?: unknown };
+  let parsed: { questions?: unknown };
+  try {
+    parsed = JSON.parse(response.text ?? "") as { questions?: unknown };
+  } catch {
+    return splitInvalidBatch(plans, avoidQuestions, model, "invalid or truncated JSON");
+  }
   const generatedQuestions = parsed.questions;
   if (!Array.isArray(generatedQuestions) || generatedQuestions.length !== plans.length) {
     const count = Array.isArray(generatedQuestions) ? generatedQuestions.length : 0;
-    throw new Error(`Gemini ${model} returned ${count} questions; expected ${plans.length}.`);
+    return splitInvalidBatch(
+      plans,
+      avoidQuestions,
+      model,
+      `returned ${count} questions; expected ${plans.length}`,
+    );
   }
 
   const seen = new Set<string>();
-  return generatedQuestions.map((item, index) => {
-    if (!item || typeof item !== "object" || !("unit_number" in item)) {
-      throw new Error(`Gemini ${model} returned an invalid question at position ${index + 1}.`);
+  const result: NetMcq[] = [];
+  try {
+    for (let index = 0; index < generatedQuestions.length; index++) {
+      const item = generatedQuestions[index];
+      if (!item || typeof item !== "object" || !("unit_number" in item)) {
+        throw new Error(`invalid question at position ${index + 1}`);
+      }
+      if (item.unit_number !== plans[index].unitNumber) {
+        throw new Error(`wrong unit for question ${index + 1}`);
+      }
+      const mcq = parseMcq(item, model);
+      const normalized = mcq.question_text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      if (seen.has(normalized)) {
+        throw new Error("duplicate questions in the batch");
+      }
+      seen.add(normalized);
+      result.push(mcq);
     }
-    if (item.unit_number !== plans[index].unitNumber) {
-      throw new Error(`Gemini ${model} returned the wrong unit for question ${index + 1}.`);
-    }
-    const mcq = parseMcq(item, model);
-    const normalized = mcq.question_text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    if (seen.has(normalized)) {
-      throw new Error(`Gemini ${model} returned duplicate questions in the daily set.`);
-    }
-    seen.add(normalized);
-    return mcq;
-  });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return splitInvalidBatch(plans, avoidQuestions, model, detail);
+  }
+  return result;
+}
+
+async function splitInvalidBatch(
+  plans: NetQuestionPlan[],
+  avoidQuestions: string[],
+  model: string,
+  reason: string,
+): Promise<NetMcq[]> {
+  if (plans.length === 1) {
+    throw new Error(`Gemini ${model} returned an invalid question (${reason}).`);
+  }
+  console.warn(`Gemini ${model} returned ${reason}; retrying in smaller batches.`);
+  const midpoint = Math.ceil(plans.length / 2);
+  const first = await generateDailyMcqBatch(plans.slice(0, midpoint), avoidQuestions);
+  const second = await generateDailyMcqBatch(plans.slice(midpoint), avoidQuestions);
+  return [...first, ...second];
 }
 
 export async function getEmbedding(text: string): Promise<number[]> {
